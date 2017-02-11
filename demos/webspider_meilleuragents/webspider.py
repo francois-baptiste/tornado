@@ -13,30 +13,39 @@ except ImportError:
 import geojson
 from tornado import httpclient, gen, ioloop, queues, curl_httpclient
 
-base_url = 'https://static0.meilleursagents.com/static/build/images/major-cities.geojson'
+start_url = 'https://static0.meilleursagents.com/static/build/images/major-cities.geojson'
+base_url = 'http://www.meilleursagents.com/prix-immobilier/'
+target_url = 'http://api.meilleursagents.com/indices/v1/indice/'
 concurrency = 10
 
+import momoko
 
-@gen.coroutine
-def get_links_from_url(url):
-    """Download the page at `url` and parse it for links.
 
-    Returned links have had the fragment after `#` removed, and have been made
-    absolute so, e.g. the URL 'gen.html#tornado.gen.coroutine' becomes
-    'http://www.tornadoweb.org/en/stable/gen.html'.
-    """
+async def get_links_from_url(url):
     try:
-        response = yield httpclient.AsyncHTTPClient().fetch(url)
+        if url.startswith(target_url):
+            print('target url %s' % url)
 
-        urls = ["http://www.meilleursagents.com"+elem['properties']['href'] for elem in geojson.loads(response.body)['features']]
+        if url == start_url:
+            response = await curl_httpclient.AsyncHTTPClient().fetch(url)
+            urls = ["http://www.meilleursagents.com" + elem['properties']['href'] for elem in
+                    geojson.loads(response.body)['features']]
+            print('fetched %s' % urls)
+            return urls
 
-        print('fetched %s' % urls)
+        if url.startswith(base_url):
+            response = await httpclient.AsyncHTTPClient().fetch(url)
+            print('fetched %s' % url)
+            html = response.body if isinstance(response.body, str) \
+                else response.body.decode()
+            urls = [urljoin(url, remove_fragment(new_url))
+                    for new_url in get_links(html)]
+            return urls
 
+        return []
     except Exception as e:
         print('Exception: %s %s' % (e, url))
-        raise gen.Return([])
-
-    raise gen.Return(urls)
+        return []
 
 
 def remove_fragment(url):
@@ -52,50 +61,51 @@ def get_links(html):
 
         def handle_starttag(self, tag, attrs):
             href = dict(attrs).get('href')
-            if href and tag == 'a':
-                self.urls.append(href)
+            # if href and tag == 'a':
+            #     if href.count("/") < 6:
+            #         self.urls.append(href)
+            src = dict(attrs).get('src')
+            if src and tag == 'img':
+                if src.endswith("/chart"):
+                    self.urls.append(src[:-len("/chart")])
 
     url_seeker = URLSeeker()
     url_seeker.feed(html)
     return url_seeker.urls
 
 
-@gen.coroutine
-def main():
+async def main():
     q = queues.Queue()
     start = time.time()
     fetching, fetched = set(), set()
 
-    @gen.coroutine
-    def fetch_url():
-        current_url = yield q.get()
+    async def fetch_url():
+        current_url = await q.get()
         try:
             if current_url in fetching:
                 return
 
             print('fetching %s' % current_url)
             fetching.add(current_url)
-            urls = yield get_links_from_url(current_url)
+            urls = await get_links_from_url(current_url)
             fetched.add(current_url)
 
             for new_url in urls:
                 # Only follow links beneath the base URL
-                yield q.put(new_url)
+                if "meilleursagents" in new_url:
+                    await q.put(new_url)
 
         finally:
             q.task_done()
 
-    @gen.coroutine
-    def worker():
-        while True:
-            yield fetch_url()
 
-    q.put(base_url)
+    q.put(start_url)
 
     # Start workers, then wait for the work queue to be empty.
     for _ in range(concurrency):
-        worker()
-    yield q.join(timeout=timedelta(seconds=300))
+        ioloop.IOLoop.current().spawn_callback(fetch_url)
+
+    await q.join(timeout=timedelta(seconds=300))
     assert fetching == fetched
     print('Done in %d seconds, fetched %s URLs.' % (
         time.time() - start, len(fetched)))
@@ -103,6 +113,15 @@ def main():
 
 if __name__ == '__main__':
     import logging
+
     logging.basicConfig()
     io_loop = ioloop.IOLoop.current()
+
+    # db = momoko.Pool(
+    #     dsn='dbname=tornado user=francois password=francois '
+    #         'host=AKASA port=32768',
+    #     size=1,
+    #     ioloop=ioloop,
+    # )
+
     io_loop.run_sync(main)
